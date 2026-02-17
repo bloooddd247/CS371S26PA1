@@ -23,16 +23,16 @@ Please specify the group members here
 # Student #3:
 */
 
+#include <arpa/inet.h>
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <pthread.h>
-#include <errno.h>
+#include <unistd.h>
 
 #define MAX_EVENTS 64
 #define MESSAGE_SIZE 16
@@ -47,14 +47,14 @@ int num_requests = 1000000;
  * This structure is used to store per-thread data in the client
  */
 typedef struct {
-    int epoll_fd;        /* epoll instance fd */
-    int socket_fd;       /* connected socket fd */
-    long long total_rtt; /* sum of RTTs in microseconds */
-    long total_messages; /* number of request/response pairs completed */
-    float request_rate;  /* messages per second (per thread) */
+    int epoll_fd;        /* File descriptor for the epoll instance */
+    int socket_fd;       /* File descriptor for the client socket connected to the server */
+    long long total_rtt; /* Accumulated RTT for all request/response pairs (microseconds) */
+    long total_messages; /* Total number of request/response pairs completed */
+    float request_rate;  /* Requests per second for this thread */
 } client_thread_data_t;
 
-/* --------- Helpers: robust send/recv for fixed-size messages --------- */
+/* ---------- Helpers: fixed-size send/recv for TCP ---------- */
 
 static long long timeval_diff_us(const struct timeval *start, const struct timeval *end) {
     long long s = (long long)start->tv_sec * 1000000LL + (long long)start->tv_usec;
@@ -65,6 +65,7 @@ static long long timeval_diff_us(const struct timeval *start, const struct timev
 static int send_full(int fd, const void *buf, size_t len) {
     const char *p = (const char *)buf;
     size_t sent = 0;
+
     while (sent < len) {
         ssize_t n = send(fd, p + sent, len - sent, 0);
         if (n > 0) {
@@ -72,7 +73,7 @@ static int send_full(int fd, const void *buf, size_t len) {
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue; /* if nonblocking */
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         return -1;
     }
     return 0;
@@ -81,6 +82,7 @@ static int send_full(int fd, const void *buf, size_t len) {
 static int recv_full(int fd, void *buf, size_t len) {
     char *p = (char *)buf;
     size_t recvd = 0;
+
     while (recvd < len) {
         ssize_t n = recv(fd, p + recvd, len - recvd, 0);
         if (n > 0) {
@@ -89,7 +91,7 @@ static int recv_full(int fd, void *buf, size_t len) {
         }
         if (n == 0) return 0; /* peer closed */
         if (n < 0 && errno == EINTR) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue; /* if nonblocking */
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         return -1;
     }
     return 1;
@@ -101,14 +103,17 @@ static int recv_full(int fd, void *buf, size_t len) {
 void *client_thread_func(void *arg) {
     client_thread_data_t *data = (client_thread_data_t *)arg;
     struct epoll_event event, events[MAX_EVENTS];
+
     char send_buf[MESSAGE_SIZE] = "ABCDEFGHIJKMLNOP"; /* 16 bytes */
     char recv_buf[MESSAGE_SIZE];
+
     struct timeval start, end;
 
-    /* Register the connected socket with this thread's epoll instance */
+    /* Register this thread's connected socket with its epoll instance */
     memset(&event, 0, sizeof(event));
-    event.events = EPOLLIN;              /* wait for server response */
+    event.events = EPOLLIN;
     event.data.fd = data->socket_fd;
+
     if (epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, data->socket_fd, &event) < 0) {
         perror("client epoll_ctl ADD");
         return NULL;
@@ -119,16 +124,13 @@ void *client_thread_func(void *arg) {
     data->request_rate = 0.0f;
 
     for (int i = 0; i < num_requests; i++) {
-        /* record send timestamp */
         gettimeofday(&start, NULL);
 
-        /* send fixed-size message */
         if (send_full(data->socket_fd, send_buf, MESSAGE_SIZE) < 0) {
             perror("client send_full");
             break;
         }
 
-        /* wait until socket is readable (response ready) */
         int nfds;
         while (1) {
             nfds = epoll_wait(data->epoll_fd, events, MAX_EVENTS, -1);
@@ -140,30 +142,27 @@ void *client_thread_func(void *arg) {
             break;
         }
 
-        int got_response = 0;
+        int ok = 0;
         for (int e = 0; e < nfds; e++) {
-            if (events[e].data.fd == data->socket_fd && (events[e].events & EPOLLIN)) {
+            if ((events[e].data.fd == data->socket_fd) && (events[e].events & EPOLLIN)) {
                 int r = recv_full(data->socket_fd, recv_buf, MESSAGE_SIZE);
                 if (r <= 0) {
-                    /* r==0 peer closed, r==-1 error */
                     if (r < 0) perror("client recv_full");
-                    got_response = -1;
+                    ok = -1;
                 } else {
-                    got_response = 1;
+                    ok = 1;
                 }
                 break;
             }
         }
-        if (got_response <= 0) break;
+        if (ok <= 0) break;
 
         gettimeofday(&end, NULL);
-        long long rtt_us = timeval_diff_us(&start, &end);
 
-        data->total_rtt += rtt_us;
+        data->total_rtt += timeval_diff_us(&start, &end);
         data->total_messages += 1;
     }
 
-    /* Compute per-thread request rate: messages / total_time_seconds */
     if (data->total_rtt > 0 && data->total_messages > 0) {
         double total_time_sec = (double)data->total_rtt / 1000000.0;
         data->request_rate = (float)((double)data->total_messages / total_time_sec);
@@ -186,12 +185,13 @@ void run_client() {
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons((uint16_t)server_port);
+
     if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) != 1) {
         fprintf(stderr, "Invalid server_ip: %s\n", server_ip);
         exit(1);
     }
 
-    /* Create sockets + epoll instances and connect for each thread */
+    /* Create sockets + epoll fds, connect each socket */
     for (int i = 0; i < num_client_threads; i++) {
         int sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd < 0) {
@@ -223,7 +223,6 @@ void run_client() {
         pthread_create(&threads[i], NULL, client_thread_func, &thread_data[i]);
     }
 
-    /* Wait for threads + aggregate */
     long long total_rtt = 0;
     long total_messages = 0;
     double total_request_rate = 0.0;
@@ -248,7 +247,8 @@ void run_client() {
 }
 
 void run_server() {
-    int listen_fd, epoll_fd;
+    int listen_fd = -1;
+    int epoll_fd = -1;
     struct sockaddr_in addr;
 
     /* Create listening socket */
@@ -268,6 +268,7 @@ void run_server() {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)server_port);
+
     if (inet_pton(AF_INET, server_ip, &addr.sin_addr) != 1) {
         fprintf(stderr, "Invalid server_ip: %s\n", server_ip);
         close(listen_fd);
@@ -286,7 +287,7 @@ void run_server() {
         exit(1);
     }
 
-    /* Create epoll instance and register listen_fd */
+    /* Create epoll instance and register listening socket */
     epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
         perror("server epoll_create1");
@@ -308,7 +309,7 @@ void run_server() {
 
     printf("Server listening on %s:%d\n", server_ip, server_port);
 
-    /* Run-to-completion event loop */
+    /* Event loop */
     struct epoll_event events[MAX_EVENTS];
     while (1) {
         int nfds;
@@ -326,34 +327,31 @@ void run_server() {
             int fd = events[i].data.fd;
 
             if (fd == listen_fd) {
-                /* Accept new connections */
-                while (1) {
-                    struct sockaddr_in caddr;
-                    socklen_t clen = sizeof(caddr);
-                    int cfd = accept(listen_fd, (struct sockaddr *)&caddr, &clen);
-                    if (cfd < 0) {
-                        if (errno == EINTR) continue;
-                        /* If you later make listen_fd nonblocking, EAGAIN means done */
-                        break;
-                    }
+                /* Accept exactly ONE connection per readiness event (prevents blocking) */
+                struct sockaddr_in caddr;
+                socklen_t clen = sizeof(caddr);
 
-                    struct epoll_event cev;
-                    memset(&cev, 0, sizeof(cev));
-                    cev.events = EPOLLIN;
-                    cev.data.fd = cfd;
+                int cfd = accept(listen_fd, (struct sockaddr *)&caddr, &clen);
+                if (cfd < 0) {
+                    perror("server accept");
+                    continue;
+                }
 
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cfd, &cev) < 0) {
-                        perror("server epoll_ctl ADD client");
-                        close(cfd);
-                    }
+                struct epoll_event cev;
+                memset(&cev, 0, sizeof(cev));
+                cev.events = EPOLLIN;
+                cev.data.fd = cfd;
+
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cfd, &cev) < 0) {
+                    perror("server epoll_ctl ADD client");
+                    close(cfd);
                 }
             } else if (events[i].events & EPOLLIN) {
-                /* Read MESSAGE_SIZE bytes and echo them back */
+                /* Read MESSAGE_SIZE bytes and echo back */
                 char buf[MESSAGE_SIZE];
                 int r = recv_full(fd, buf, MESSAGE_SIZE);
 
                 if (r == 0) {
-                    /* client closed */
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
                     close(fd);
                 } else if (r < 0) {
@@ -368,15 +366,14 @@ void run_server() {
                     }
                 }
             } else {
-                /* Any other event types: close for simplicity */
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
                 close(fd);
             }
         }
     }
 
-    close(epoll_fd);
-    close(listen_fd);
+    if (epoll_fd >= 0) close(epoll_fd);
+    if (listen_fd >= 0) close(listen_fd);
 }
 
 int main(int argc, char *argv[]) {
